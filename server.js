@@ -115,7 +115,7 @@ const validId = (req, res, next) => {
 
 // ---------- auth ----------
 app.get("/api/health", (req, res) => res.json({
-  ok: true, service: "token-tracker-api",
+  ok: true, service: "token-tracker-api", version: "edit-route-v2",
   db: mongoose.connection.readyState === 1 ? "connected" : "disconnected"
 }));
 
@@ -353,6 +353,85 @@ app.post("/api/entries", auth, asyncRoute(async (req, res) => {
   await entry.populate([{ path: "createdBy", select: "name email" }, { path: "branch", select: "name" }]);
   res.status(201).json({ entry });
 }));
+
+// Edit an entry (the ✓ button in the entries table).
+// Accepts any of: date, token, quantity, rate, notes, paymentMethod, paymentRef, branch.
+// Admin can edit any entry; everyone else only their own.
+async function updateEntry(req, res) {
+  const entry = await Entry.findById(req.params.id);
+  if (!entry) return res.status(404).json({ message: "Entry not found. It may have been deleted — refresh the page." });
+  if (req.user.role !== "admin" && !entry.createdBy.equals(req.user._id)) {
+    return res.status(403).json({ message: "You can only edit your own entries." });
+  }
+  const b = req.body || {};
+  if (b.type !== undefined && b.type !== entry.type) {
+    return res.status(400).json({ message: "Type can't be changed. Delete this entry and add a new one instead." });
+  }
+
+  const token = b.token !== undefined ? String(b.token).trim() : entry.token;
+  const quantity = b.quantity !== undefined ? Number(b.quantity) : entry.quantity;
+  const rate = b.rate !== undefined ? Number(b.rate) : entry.rate;
+  const date = b.date !== undefined ? new Date(b.date) : entry.date;
+  const notes = b.notes !== undefined ? String(b.notes ?? "").trim() : entry.notes;
+  const paymentRef = b.paymentRef !== undefined ? String(b.paymentRef ?? "").trim() : entry.paymentRef;
+  const paymentMethod = b.paymentMethod !== undefined ? b.paymentMethod : entry.paymentMethod;
+
+  if (!token || token.length > 100) return res.status(400).json({ message: "Enter a token/product name (max 100 characters)." });
+  if (!Number.isFinite(quantity) || quantity < MIN_QUANTITY) return res.status(400).json({ message: `Quantity must be at least ${MIN_QUANTITY}.` });
+  if (!Number.isFinite(rate) || rate < 0) return res.status(400).json({ message: "Rate cannot be negative." });
+  if (Number.isNaN(new Date(date).getTime())) return res.status(400).json({ message: "Enter a valid date." });
+  if (notes.length > 500) return res.status(400).json({ message: "Notes can be at most 500 characters." });
+  if (b.paymentMethod !== undefined && !PAYMENT_METHODS.includes(paymentMethod)) return res.status(400).json({ message: "Choose a payment method." });
+  if (paymentRef.length > 100) return res.status(400).json({ message: "Payment reference can be at most 100 characters." });
+
+  // Managers may move a sale to another branch.
+  let branch = entry.branch;
+  if (entry.type === "sale" && b.branch !== undefined && isManager(req.user) && String(b.branch) !== String(entry.branch)) {
+    const found = await findActiveBranch(b.branch);
+    if (found.error) return res.status(400).json({ message: found.error });
+    branch = found.branch._id;
+  }
+
+  // Stock checks
+  const oldKey = entry.tokenKey;
+  const newKey = tokenKeyOf(token);
+  if (entry.type === "sale") {
+    // This sale's own quantity is already counted as sold; add it back if the token stays the same.
+    const available = (await availableStock(newKey)) + (newKey === oldKey ? entry.quantity : 0);
+    if (quantity > available + EPS) {
+      return res.status(400).json({
+        message: available > 0 ? `Only ${round(available)} of "${token}" in stock.` : `"${token}" is out of stock.`
+      });
+    }
+  } else {
+    // A purchase can't be reduced or moved below what has already been sold from it.
+    const available = await availableStock(oldKey);
+    const removed = newKey === oldKey ? entry.quantity - quantity : entry.quantity;
+    if (available - removed < -EPS) {
+      return res.status(409).json({
+        message: newKey === oldKey
+          ? `Can't reduce below ${round(entry.quantity - available)}: that stock has already been sold.`
+          : `Can't change the token: ${round(entry.quantity - available)} of "${entry.token}" from this purchase is already sold.`
+      });
+    }
+  }
+
+  entry.token = token;
+  entry.quantity = quantity;
+  entry.rate = rate;          // amount + tokenKey are recalculated by the model's pre("validate") hook
+  entry.date = date;
+  entry.notes = notes;
+  entry.paymentMethod = paymentMethod;
+  entry.paymentRef = paymentRef;
+  entry.branch = branch;
+  await entry.save();
+  await entry.populate([{ path: "createdBy", select: "name email" }, { path: "branch", select: "name" }]);
+  res.json({ entry });
+}
+
+// Registered for both PATCH and PUT so it works whichever the frontend uses.
+app.patch("/api/entries/:id", auth, validId, asyncRoute(updateEntry));
+app.put("/api/entries/:id", auth, validId, asyncRoute(updateEntry));
 
 // Update how an entry was paid, e.g. settle an "on credit" sale once the customer pays.
 app.patch("/api/entries/:id/payment", auth, validId, asyncRoute(async (req, res) => {
